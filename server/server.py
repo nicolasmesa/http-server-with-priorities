@@ -17,7 +17,9 @@ Request = collections.namedtuple('Request', [
 ])
 
 class HttpServerWithPriorities:
-    def __init__(self, sock=None, port=8081, hostname='0.0.0.0', max_conns=100, num_threads=2, num_high_priority_threads=1):
+    """HTTP Server that has different priorities based on the request"""
+
+    def __init__(self, sock=None, port=8081, hostname='0.0.0.0', max_conns=100, num_threads=4, num_high_priority_threads=1, debug_queues=False):
         if sock is None:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -33,6 +35,8 @@ class HttpServerWithPriorities:
         self.request_queue = queue.Queue()
         self._threads = [threading.Thread(target=self._worker_target) for _ in range(num_threads)]
         self._high_priority_threads = [threading.Thread(target=self._high_priority_target) for _ in range(num_high_priority_threads)]
+
+        self._queue_monitor = threading.Thread(target=self._monitor_queues) if debug_queues else None
         self._running = True
 
 
@@ -44,6 +48,9 @@ class HttpServerWithPriorities:
         logger.info('Starring %s high priority worker threads', len(self._high_priority_threads))
         for t in self._high_priority_threads:
             t.start()
+
+        if self._queue_monitor:
+            self._queue_monitor.start();
 
         while self._running:
             logger.debug("Waiting for connection...")
@@ -61,6 +68,7 @@ class HttpServerWithPriorities:
             self._cv.acquire()
             while not self._something_in_queue():
                 self._cv.wait()
+                logger.debug("_worker_target notified")
             request = self._get_existing_request()
             logger.info("worker thread dequeued request(%s)", request)
             self._cv.release()
@@ -71,7 +79,9 @@ class HttpServerWithPriorities:
         while self._running:
             self._cv.acquire()
             while not self._something_in_high_priority_queue():
+                self._cv.notify() # we're swallowing a notify if we don't process a low priority request
                 self._cv.wait()
+                logger.debug("_high_priority_target notified")
             request = self._get_existing_request() # should be guaranteed to be high priority
             logger.info("High priority thread dequeued request(%s)", request)
             self._cv.release()
@@ -83,13 +93,19 @@ class HttpServerWithPriorities:
         if request.path == '/ping':
             body = b'healthy'
         elif request.path == '/long':
-            logger.debug("Sleeping for one second to simulat a long request")
+            logger.debug("Sleeping for one second to simulate a long request")
             time.sleep(1)
-            logger.debug('Woke up')
+            logger.debug('Woke up from thread.sleep')
             body = b'Long long'
 
         self._write_response(request, body)
         request.sock.close()
+
+    def _monitor_queues(self):
+        while self._running:
+            for priority in self._queues:
+                logger.debug("queues[%s].empty() = %s", priority, self._queues[priority].empty())
+            time.sleep(3)
 
     def _get_existing_request(self):
         # TODO Make more extensible. Should be able to have multiple high queues and other priorities
@@ -143,9 +159,14 @@ class HttpServerWithPriorities:
                 break
 
         first_line = str(data.split(b'\r\n')[0], encoding='UTF-8')
-        request_args = first_line.split()
-        request_args.append(clientsocket)
-        return Request(*request_args)
+
+        try:
+            method, path, version = first_line.split()
+            return Request(method=method, path=path, http_version=version, sock=clientsocket)
+        except:
+            logger.error("First line seems to be wrong '%s'", first_line)
+            raise
+
 
     def _write_response(self, request, body):
         clientsocket = request.sock
